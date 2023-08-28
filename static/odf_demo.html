@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <link rel="shortcut icon" type="image/x-icon" href="favicon_railway.ico">
+    <title>Haltestellenansage ODF</title>
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <link rel="stylesheet" href="leaflet/leaflet.css">
+    <style>
+        html,
+        body {
+            height: 100%;
+            margin: 0;
+            min-height: 100%;
+        }
+
+        #map {
+            width: 100%;
+            min-height: 285px;
+            height: 98%;
+        }
+
+        .info {
+            padding: 6px 8px;
+            font: 14px/16px Arial, Helvetica, sans-serif;
+            background: white;
+            background: rgba(255, 255, 255, 0.8);
+            box-shadow: 0 0 15px rgba(0, 0, 0, 0.2);
+            border-radius: 5px;
+        }
+
+        .grid-container {
+            display: grid;
+            column-gap: 5px;
+            row-gap: 5px;
+        }
+    </style>
+</head>
+
+<body>
+    <audio id="myAudio">
+        <source id="announcementFile" src="DW_abfahrt_ZBF.wav" type="audio/wav">
+    </audio>
+    <div id="map"></div>
+    <template id="infoTemplate">
+        <div class="grid-container">
+            <button onclick="replayData();" id="startButton" name="startButton">start</button>
+            <div><span id="infoSpeedKm">0</span>&nbsp;km/h</div>
+        </div>
+    </template>
+    <script src="leaflet/leaflet.js"></script>
+    <script src="turf.min.js"></script>
+    <script src="no_sleep.min.js"></script>
+    <script>
+        var map = L.map('map', {
+            minZoom: 0,
+            maxZoom: 19
+        });
+        map.setView([52.312, 8.005], 17);
+        map.attributionControl.addAttribution(
+            '<a href="https://github.com/jaluebbe/GPSTracker">Source on GitHub</a>');
+        // add link to privacy statement
+        //map.attributionControl.addAttribution(
+        //    '<a href="static/datenschutz.html" target="_blank">Datenschutzerkl&auml;rung</a>');
+        L.control.scale({
+            'imperial': false
+        }).addTo(map);
+
+        var noSleep = new NoSleep();
+
+        var info = L.control({
+            position: 'bottomright'
+        });
+        info.onAdd = function(map) {
+            this._div = L.DomUtil.create('div', 'info');
+            let tempSource = document.getElementById('infoTemplate');
+            this._div.appendChild(tempSource.content.cloneNode(true));
+            L.DomEvent.disableClickPropagation(this._div);
+            return this._div;
+        };
+
+        function updateSpeed(speed) {
+            infoSpeedKm.innerHTML = (speed * 3.6).toFixed(0);
+        };
+
+        info.addTo(map);
+        var leftInfo = L.control({
+            position: 'bottomleft'
+        });
+
+        var myMarker = L.marker([], {
+            zIndexOffset: 1000
+        });
+        myMarker.bindTooltip("", {
+            direction: 'top'
+        });
+
+        function onLocationFound(e) {
+            myMarker.setLatLng(e.latlng);
+            if (!map.hasLayer(myMarker)) {
+                myMarker.addTo(map);
+            }
+            if (!map.getBounds().contains(e.latlng)) {
+                map.setView(e.latlng);
+            }
+            var centerPoint = turf.point([e.longitude, e.latitude]);
+            turf.featureEach(odfWaypoints, function(feature, featureIndex) {
+                let distance = turf.distance(centerPoint, feature) * 1e3;
+                if (distance < 50) {
+                    if (feature.properties.type == "preparation") {
+                        announcementReady.add(feature.properties.id);
+                    } else if (feature.properties.type == "final") {
+                        if (announcementReady.has(feature.properties.id)) {
+                            announcementReady.delete(feature.properties.id);
+                            announcementFile.src = feature.properties.sound;
+                            myAudio.load();
+                            myAudio.play();
+                        }
+                    }
+                }
+            })
+            if (typeof e.speed !== "undefined") {
+                myMarker._tooltip.setContent('' + Math.round(e.speed * 100) / 100 + '&nbsp;m/s');
+                updateSpeed(e.speed);
+            } else {
+                myMarker._tooltip.setContent('');
+            }
+        }
+
+        var running = false;
+        const urlParams = new URLSearchParams(window.location.search);
+        const maxReplaySleep = (urlParams.has('limit') ? parseFloat(urlParams.get('limit')) : 1);
+        const replaySleepFactor = (urlParams.has('factor') ? parseFloat(urlParams.get('factor')) : 0.16);
+        
+        function sleep(seconds) {
+            return new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+        }
+
+        async function processFakeData(fakeData) {
+            noSleep.enable();
+            running = true;
+            let old_utc = null;
+            for (const message of fakeData) {
+                if (running == false)
+                    break;
+                let location = L.latLng(message.lat, message.lon);
+                let error = message.hdop * 15;
+                let e = {
+                    latlng: location,
+                    latitude: message.lat,
+                    longitude: message.lon,
+                    speed: message.speed,
+                }
+                if (old_utc != null)
+                    await sleep(Math.min(replaySleepFactor * (message.utc - old_utc), maxReplaySleep));
+                map.panTo(e.latlng);
+                onLocationFound(e);
+                old_utc = message.utc;
+            }
+            noSleep.disable();
+            running = false;
+        };
+
+        function replayData() {
+            if (running == true)
+                return;
+            myAudio.load();
+            fetch('./odf_tracking_data.json')
+                .then((response) => response.json())
+                .then((fakeData) => processFakeData(fakeData))
+        };
+
+        var wmsNiedersachsenDOP = L.tileLayer.wms('https://www.geobasisdaten.niedersachsen.de/doorman/noauth/wms_ni_dop', {
+            layers: 'WMS_NI_DOP,dop20',
+            format: 'image/png',
+            minZoom: 11,
+            maxZoom: 21,
+            attribution: '&copy <a href="https://www.lgln.niedersachsen.de">' +
+                'Landesamt für Geoinformation und Landesvermessung Niedersachsen</a>'
+        }).addTo(map);
+        var announcementReady = new Set();
+        var odfWaypoints = {
+            "type": "FeatureCollection",
+            "features": [{
+                    "type": "Feature",
+                    "properties": {
+                        type: "preparation",
+                        id: "abfahrt_zechenbahnhof"
+                    },
+                    "geometry": {
+                        "coordinates": [
+                            8.003417,
+                            52.3115061
+                        ],
+                        "type": "Point"
+                    }
+                },
+                {
+                    "type": "Feature",
+                    "properties": {
+                        type: "final",
+                        id: "abfahrt_zechenbahnhof",
+                        sound: "DW_abfahrt_ZBF.wav"
+                    },
+                    "geometry": {
+                        "coordinates": [
+                            8.000547,
+                            52.308118
+                        ],
+                        "type": "Point"
+                    }
+                },
+                {
+                    "type": "Feature",
+                    "properties": {
+                        type: "preparation",
+                        id: "vom_zechenbahnhof_richtung_altstadt"
+                    },
+                    "geometry": {
+                        "coordinates": [
+                            8.003036,
+                            52.302591
+                        ],
+                        "type": "Point"
+                    }
+                },
+                {
+                    "type": "Feature",
+                    "properties": {
+                        type: "final",
+                        id: "vom_zechenbahnhof_richtung_altstadt",
+                        sound: "DW_altstadt_kuerze.wav"
+                    },
+                    "geometry": {
+                        "coordinates": [
+                            8.028973,
+                            52.289688
+                        ],
+                        "type": "Point"
+                    }
+                },
+                {
+                    "type": "Feature",
+                    "properties": {
+                        type: "preparation",
+                        id: "von_altstadt_richtung_hauptbahnhof"
+                    },
+                    "geometry": {
+                        "coordinates": [
+                            8.047603,
+                            52.279931
+                        ],
+                        "type": "Point"
+                    }
+                },
+                {
+                    "type": "Feature",
+                    "properties": {
+                        type: "final",
+                        id: "von_altstadt_richtung_hauptbahnhof",
+                        sound: "DW_HBF_OS2.wav"
+                    },
+                    "geometry": {
+                        "coordinates": [
+                            8.051144,
+                            52.278116
+                        ],
+                        "type": "Point"
+                    }
+                }
+            ]
+        };
+        var waypointLayer = L.geoJSON([], {
+            pointToLayer: function(feature, latlng) {
+                if (feature.properties.type == "preparation")
+                    return L.circle(latlng, {
+                        radius: 50,
+                        color: "yellow"
+                    });
+                else if (feature.properties.type == "final")
+                    return L.circle(latlng, {
+                        radius: 50,
+                        color: "red"
+                    });
+            }
+        }).addTo(map);
+        waypointLayer.addData(odfWaypoints);
+    </script>
+</body>
+
+</html>
